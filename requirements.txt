@@ -1,0 +1,10 @@
+numpy>=1.24
+opencv-python
+scipy
+scikit-learn
+pandas
+matplotlib
+tqdm
+PyYAML
+torch>=2.0
+pyserial>=3.5

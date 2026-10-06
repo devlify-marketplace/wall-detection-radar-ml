@@ -1,85 +1,120 @@
 import os
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
 import numpy as np
 from torch.utils.data import Dataset
 import cv2
 
-def load_radar_sample(path: str) -> Tuple[np.ndarray, int]:
-    """Load a radar sample from an .npz file."""
+
+def load_sequence_sample(path: str):
+    """Load a radar sequence sample from .npz file."""
     data = np.load(path, allow_pickle=True)
-    sample = data["sample"]
+    frames = data["frames"]
     label = int(data["label"])
-    return sample, label
+    metadata = data["metadata"].item() if "metadata" in data else {}
+    return frames, label, metadata
+
 
 def build_dataset(data_dir: str) -> Tuple[List[str], List[str]]:
-    """Build lists of training and validation file paths from a directory structure."""
+    """Build training and validation file lists."""
     labels = ["0", "1"]
     train_files = []
     val_files = []
-    
+
     for cls in labels:
         class_dir = os.path.join(data_dir, cls)
         if not os.path.isdir(class_dir):
             continue
-        
-        files = sorted([os.path.join(class_dir, f) for f in os.listdir(class_dir) if f.endswith(".npz")])
-        
+
+        files = sorted([
+            os.path.join(class_dir, f)
+            for f in os.listdir(class_dir)
+            if f.endswith(".npz")
+        ])
+
         if len(files) == 0:
             continue
-        
-        # Simple split: 80/20
+
+        # 80/20 split
         split_idx = max(1, int(len(files) * 0.8))
         train_files.extend(files[:split_idx])
         val_files.extend(files[split_idx:])
-    
+
     return train_files, val_files
 
-class RadarDataset(Dataset):
-    """PyTorch Dataset for radar samples."""
+
+class RadarSequenceDataset(Dataset):
+    """PyTorch Dataset for radar sequences."""
     
-    def __init__(self, file_list: List[str], image_size: int = 64, transform=None):
+    def __init__(
+        self,
+        file_list: List[str],
+        sequence_length: int = 10,
+        image_size: int = 64,
+        augment: bool = False,
+    ):
         self.file_list = file_list
+        self.sequence_length = sequence_length
         self.image_size = image_size
-        self.transform = transform
+        self.augment = augment
 
     def __len__(self):
         return len(self.file_list)
 
     def __getitem__(self, idx: int):
         path = self.file_list[idx]
-        sample, label = load_radar_sample(path)
-        arr = np.asarray(sample, dtype=np.float32)
+        frames, label, _ = load_sequence_sample(path)
 
-        # If the sample is already 2D, use it directly.
-        # If it is a 1D vector, reshape to a square image.
-        if arr.ndim == 1:
-            arr = np.reshape(arr, (self.image_size, self.image_size))
-        elif arr.ndim == 2:
-            pass
-        else:
-            # Reduce high-dimensional data to a 2D image-like representation
-            arr = arr[0]
+        frames = np.asarray(frames, dtype=np.float32)
 
-        # Resize to a fixed size for model input
-        arr = self._resize_image(arr, self.image_size)
+        if frames.ndim == 2:
+            frames = frames[None, :, :]
+
+        # Adjust sequence length
+        if frames.shape[0] < self.sequence_length:
+            # Repeat last frame
+            pad_needed = self.sequence_length - frames.shape[0]
+            pad = np.repeat(frames[-1:], pad_needed, axis=0)
+            frames = np.concatenate([frames, pad], axis=0)
+        elif frames.shape[0] > self.sequence_length:
+            # Take centered window
+            start = max(0, (frames.shape[0] - self.sequence_length) // 2)
+            frames = frames[start:start + self.sequence_length]
 
         # Normalize
-        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-        arr = arr.astype(np.float32)
+        frames = self._normalize_frames(frames)
+        
+        # Resize
+        frames = self._resize_frames(frames, self.image_size)
+        
+        # Augmentation (optional)
+        if self.augment:
+            frames = self._augment(frames)
+        
+        # Add channel dimension: (T, H, W) -> (T, 1, H, W)
+        frames = frames[:, None, :, :]
 
-        if arr.ndim == 2:
-            arr = arr[None, :, :]  # CxHxW
+        return frames, float(label)
 
-        if self.transform is not None:
-            arr = self.transform(arr)
+    def _normalize_frames(self, frames: np.ndarray) -> np.ndarray:
+        frames = frames.astype(np.float32)
+        frames_min = np.min(frames)
+        frames_max = np.max(frames)
+        if frames_max > frames_min:
+            frames = (frames - frames_min) / (frames_max - frames_min)
+        return frames
 
-        return arr, float(label)
-
-    def _resize_image(self, arr: np.ndarray, size: int) -> np.ndarray:
-        """Resize array to specified size."""
-        if arr.shape[0] == size and arr.shape[1] == size:
-            return arr
-
-        arr = cv2.resize(arr, (size, size), interpolation=cv2.INTER_AREA)
-        return arr
+    def _resize_frames(self, frames: np.ndarray, image_size: int) -> np.ndarray:
+        resized = []
+        for frame in frames:
+            frame = cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
+            resized.append(frame)
+        return np.stack(resized, axis=0)
+    
+    def _augment(self, frames: np.ndarray) -> np.ndarray:
+        """Light augmentation: random noise, slight rotation."""
+        # Add Gaussian noise
+        noise = np.random.normal(0, 0.01, frames.shape)
+        frames = frames + noise
+        frames = np.clip(frames, 0, 1)
+        return frames
